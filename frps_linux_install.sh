@@ -210,6 +210,7 @@ http_get() {
     local output=""
 
     while IFS= read -r candidate; do
+        print_info "请求地址: ${candidate}"
         if output="$(curl --silent --show-error --fail --location \
             --connect-timeout "${HTTP_CONNECT_TIMEOUT}" --max-time "${HTTP_MAX_TIME}" \
             "${candidate}")"; then

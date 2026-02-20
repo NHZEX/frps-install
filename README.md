@@ -23,13 +23,13 @@ sudo ./frps_linux_install.sh install
 ### 一键脚本
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nhzex/frps-install/main/frps_linux_install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/nhzex/frps-install/refs/heads/dev/main/frps_linux_install.sh | sudo bash
 ```
 
 #### 加速代理
 
 ```bash
-curl -fsSL https://hk.gh-proxy.org/https://raw.githubusercontent.com/nhzex/frps-install/main/frps_linux_install.sh | sudo bash
+curl -fsSL https://hk.gh-proxy.org/https://raw.githubusercontent.com/nhzex/frps-install/refs/heads/dev/main/frps_linux_install.sh | sudo bash
 ```
 
 ## 主要能力
