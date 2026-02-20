@@ -119,8 +119,9 @@ sudo bash frps_linux_uninstall.sh
 
 - 代理模式：`--proxy=auto|on|off`
   - `auto`：先直连，失败后走 `https://gh-proxy.com/`
-  - `on`：优先走 `gh-proxy`，失败回退直连
-  - `off`：仅直连
+  - `on`：始终通过代理，不回退直连
+  - `off`：仅直连（会自动清理被注入的代理前缀 URL）
+- 脚本会自动净化被代理前缀污染的 GitHub URL（如 `https://gh-proxy.../https://api.github.com/...`），保证 API 地址纯净后再按代理模式请求
 - 依赖工具：`curl`、`jq`、`tar`、`sha256sum`
 - 在 Debian/Ubuntu 上，缺少依赖时脚本会询问后自动 `apt-get install`
 

@@ -73,6 +73,7 @@ frps 安装与管理脚本（仅 frps）
 
 全局参数:
   --proxy=auto|on|off   GitHub 请求代理模式，默认 auto
+                        auto: 先直连失败后代理；on: 始终代理；off: 始终直连
   -y, --yes             自动确认（跳过交互确认）
   -h, --help            显示帮助
 
@@ -177,25 +178,94 @@ version_to_tag() {
 }
 
 ensure_proxy_prefix() {
+    if [[ "${GH_PROXY_PREFIX}" != http://* && "${GH_PROXY_PREFIX}" != https://* ]]; then
+        GH_PROXY_PREFIX="https://${GH_PROXY_PREFIX}"
+    fi
     if [[ "${GH_PROXY_PREFIX}" != */ ]]; then
         GH_PROXY_PREFIX="${GH_PROXY_PREFIX}/"
     fi
 }
 
+normalize_proxy_mode() {
+    local mode="${1:-auto}"
+    mode="${mode,,}"
+    case "${mode}" in
+        auto|on|off)
+            echo "${mode}"
+            ;;
+        always|force|proxy)
+            echo "on"
+            ;;
+        direct|none|disable)
+            echo "off"
+            ;;
+        *)
+            print_error "无效 --proxy 参数: ${mode}（允许: auto|on|off；别名: always|force|proxy）"
+            exit 1
+            ;;
+    esac
+}
+
+known_proxy_prefixes() {
+    ensure_proxy_prefix
+    printf '%s\n' "${GH_PROXY_PREFIX}"
+    printf '%s\n' "https://hk.gh-proxy.org/" "http://hk.gh-proxy.org/"
+    printf '%s\n' "https://cdn.gh-proxy.org/" "http://cdn.gh-proxy.org/"
+    printf '%s\n' "https://edgeone.gh-proxy.org/" "http://edgeone.gh-proxy.org/"
+    printf '%s\n' "https://fastlyacname.gh-proxy.org/" "http://fastlyacname.gh-proxy.org/"
+    printf '%s\n' "https://ghproxy.net/" "http://ghproxy.net/"
+    printf '%s\n' "https://ghfast.top/" "http://ghfast.top/"
+}
+
+sanitize_remote_url() {
+    local raw_url="$1"
+    local cleaned_url="${raw_url}"
+    local changed="1"
+    local prefix=""
+    local -a prefixes=()
+
+    mapfile -t prefixes < <(known_proxy_prefixes)
+    while [[ "${changed}" == "1" ]]; do
+        changed="0"
+        for prefix in "${prefixes[@]}"; do
+            [[ -z "${prefix}" ]] && continue
+            if [[ "${cleaned_url}" == "${prefix}"http://* || "${cleaned_url}" == "${prefix}"https://* ]]; then
+                cleaned_url="${cleaned_url:${#prefix}}"
+                changed="1"
+            fi
+        done
+    done
+
+    printf '%s' "${cleaned_url}"
+}
+
+sanitize_runtime_urls() {
+    LATEST_RELEASE_API="$(sanitize_remote_url "${LATEST_RELEASE_API}")"
+    RECENT_RELEASES_API="$(sanitize_remote_url "${RECENT_RELEASES_API}")"
+    TAG_RELEASE_API_BASE="$(sanitize_remote_url "${TAG_RELEASE_API_BASE}")"
+}
+
 build_url_candidates() {
     local raw_url="$1"
+    local clean_url=""
     ensure_proxy_prefix
+    PROXY_MODE="$(normalize_proxy_mode "${PROXY_MODE}")"
+    clean_url="$(sanitize_remote_url "${raw_url}")"
+    if [[ "${clean_url}" != http://* && "${clean_url}" != https://* ]]; then
+        print_error "URL 非法或被污染: ${raw_url}"
+        return 1
+    fi
+
     case "${PROXY_MODE}" in
         off)
-            printf '%s\n' "${raw_url}"
+            printf '%s\n' "${clean_url}"
             ;;
         on)
-            printf '%s\n' "${GH_PROXY_PREFIX}${raw_url}"
-            printf '%s\n' "${raw_url}"
+            printf '%s\n' "${GH_PROXY_PREFIX}${clean_url}"
             ;;
         auto)
-            printf '%s\n' "${raw_url}"
-            printf '%s\n' "${GH_PROXY_PREFIX}${raw_url}"
+            printf '%s\n' "${clean_url}"
+            printf '%s\n' "${GH_PROXY_PREFIX}${clean_url}"
             ;;
         *)
             print_error "无效 --proxy 参数: ${PROXY_MODE}（允许: auto|on|off）"
@@ -811,6 +881,10 @@ parse_global_options() {
         esac
     done
 
+    PROXY_MODE="$(normalize_proxy_mode "${PROXY_MODE}")"
+    ensure_proxy_prefix
+    sanitize_runtime_urls
+
     REMAINING_ARGS=("$@")
 }
 
@@ -852,6 +926,7 @@ main() {
                 esac
                 shift
             done
+            PROXY_MODE="$(normalize_proxy_mode "${PROXY_MODE}")"
             install_or_update "${requested}"
             ;;
         update)
