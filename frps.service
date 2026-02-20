@@ -7,7 +7,7 @@ Wants=network.target
 Type=simple
 Restart=on-failure
 RestartSec=5s
-ExecStart=/usr/local/frp/frps -c /usr/local/frp/frps.toml
+ExecStart=/usr/local/bin/frps -c /etc/frp/frps.toml
 
 [Install]
 WantedBy=multi-user.target
