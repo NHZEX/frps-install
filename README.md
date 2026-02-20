@@ -53,6 +53,10 @@ bash frps_linux_install.sh latest
 
 # 最近 6 个版本
 bash frps_linux_install.sh list
+
+# 最近 10 个版本
+bash frps_linux_install.sh list 10
+bash frps_linux_install.sh list --count=10
 ```
 
 ### 安装与更新
@@ -121,7 +125,9 @@ sudo bash frps_linux_uninstall.sh
   - `auto`：先直连，失败后走 `https://gh-proxy.com/`
   - `on`：始终通过代理，不回退直连
   - `off`：仅直连（会自动清理被注入的代理前缀 URL）
+- 手动指定代理前缀：`--proxy-prefix=https://your-proxy.example/`（仅支持 `https://`）
 - 脚本会自动净化被代理前缀污染的 GitHub URL（如 `https://gh-proxy.../https://api.github.com/...`），保证 API 地址纯净后再按代理模式请求
+- 未手动指定 `--proxy-prefix` 时，脚本会按内置代理前缀列表循环重试一次（可通过 `--help` 查看列表）
 - 依赖工具：`curl`、`jq`、`tar`、`sha256sum`
 - 在 Debian/Ubuntu 上，缺少依赖时脚本会询问后自动 `apt-get install`
 

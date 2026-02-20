@@ -19,13 +19,30 @@ INSTALL_BIN_PATH="${INSTALL_BIN_PATH:-/usr/local/bin/frps}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/frp}"
 CONFIG_PATH="${CONFIG_PATH:-/etc/frp/frps.toml}"
 SYSTEMD_UNIT_PATH="${SYSTEMD_UNIT_PATH:-/etc/systemd/system/frps.service}"
-GH_PROXY_PREFIX="${GH_PROXY_PREFIX:-https://hk.gh-proxy.org/}"
+
+# * 标记用户是否手动指定了代理前缀（环境变量或命令行）
+if [[ -n "${GH_PROXY_PREFIX+x}" ]]; then
+    GH_PROXY_PREFIX_MANUAL=1
+else
+    GH_PROXY_PREFIX_MANUAL=0
+fi
+GH_PROXY_PREFIX=""
+DEFAULT_PROXY_PREFIXES=(
+    "https://hk.gh-proxy.org/"
+    "https://gh-proxy.org/"
+    "https://cdn.gh-proxy.org/"
+    "https://edgeone.gh-proxy.org/"
+    "https://fastlyacname.gh-proxy.org/"
+    "https://ghproxy.net/"
+    "https://ghfast.top/"
+)
+
 # * 代理模式: auto|on|off
 PROXY_MODE="${PROXY_MODE:-auto}"
 AUTO_CONFIRM="${AUTO_CONFIRM:-0}"
 AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-1}"
 HTTP_CONNECT_TIMEOUT="${HTTP_CONNECT_TIMEOUT:-8}"
-HTTP_MAX_TIME="${HTTP_MAX_TIME:-45}"
+HTTP_MAX_TIME="${HTTP_MAX_TIME:-30}"
 TMP_ROOT="${TMP_ROOT:-/tmp}"
 
 # * 兼容旧路径（用于提示与清理）
@@ -34,7 +51,7 @@ LEGACY_CONFIG_PATH="/usr/local/frp/frps.toml"
 LEGACY_UNIT_PATH="/lib/systemd/system/frps.service"
 
 LATEST_RELEASE_API="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest"
-RECENT_RELEASES_API="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases?page=1&per_page=6"
+RELEASES_API_BASE="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases"
 TAG_RELEASE_API_BASE="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/tags"
 
 CURRENT_TEMP_DIR=""
@@ -74,6 +91,7 @@ frps 安装与管理脚本（仅 frps）
 全局参数:
   --proxy=auto|on|off   GitHub 请求代理模式，默认 auto
                         auto: 先直连失败后代理；on: 始终代理；off: 始终直连
+  --proxy-prefix=URL    手动指定单个代理前缀（必须 https:// 开头）
   -y, --yes             自动确认（跳过交互确认）
   -h, --help            显示帮助
 
@@ -81,8 +99,12 @@ frps 安装与管理脚本（仅 frps）
   latest
       输出最新版本号（如 0.67.0）
 
-  list
-      列出最近 6 个发布版本
+  list [COUNT]
+      列出最近 COUNT 个发布版本（默认 6）
+      示例:
+        ./frps_linux_install.sh list
+        ./frps_linux_install.sh list 10
+        ./frps_linux_install.sh list --count=10
 
   install [VERSION]
       安装指定版本；不传版本则安装最新版本
@@ -110,6 +132,13 @@ frps 安装与管理脚本（仅 frps）
       卸载 frps 二进制与 systemd；默认保留配置文件
       --purge: 一并删除配置文件
 EOF
+
+    echo ""
+    echo "内置代理前缀参考（未手动指定 --proxy-prefix 时，代理重试会按以下顺序循环一次）:"
+    local prefix=""
+    while IFS= read -r prefix; do
+        echo "  - ${prefix}"
+    done < <(known_proxy_prefixes)
 }
 
 is_root() {
@@ -178,7 +207,11 @@ version_to_tag() {
 }
 
 ensure_proxy_prefix() {
-    if [[ "${GH_PROXY_PREFIX}" != http://* && "${GH_PROXY_PREFIX}" != https://* ]]; then
+    if [[ "${GH_PROXY_PREFIX}" == http://* ]]; then
+        print_error "代理前缀仅支持 https://，不支持 http://: ${GH_PROXY_PREFIX}"
+        exit 1
+    fi
+    if [[ "${GH_PROXY_PREFIX}" != https://* ]]; then
         GH_PROXY_PREFIX="https://${GH_PROXY_PREFIX}"
     fi
     if [[ "${GH_PROXY_PREFIX}" != */ ]]; then
@@ -207,71 +240,105 @@ normalize_proxy_mode() {
 }
 
 known_proxy_prefixes() {
+    local raw_prefix=""
+    local prefix=""
+    local -A seen_prefix=()
+
+    for raw_prefix in "${DEFAULT_PROXY_PREFIXES[@]}"; do
+        prefix="${raw_prefix}"
+        [[ "${prefix}" != https://* ]] && continue
+        [[ "${prefix}" != */ ]] && prefix="${prefix}/"
+        if [[ -z "${seen_prefix["${prefix}"]+x}" ]]; then
+            seen_prefix["${prefix}"]=1
+            printf '%s\n' "${prefix}"
+        fi
+    done
+}
+
+proxy_retry_prefixes() {
     ensure_proxy_prefix
-    printf '%s\n' "${GH_PROXY_PREFIX}"
-    printf '%s\n' "https://hk.gh-proxy.org/" "http://hk.gh-proxy.org/"
-    printf '%s\n' "https://cdn.gh-proxy.org/" "http://cdn.gh-proxy.org/"
-    printf '%s\n' "https://edgeone.gh-proxy.org/" "http://edgeone.gh-proxy.org/"
-    printf '%s\n' "https://fastlyacname.gh-proxy.org/" "http://fastlyacname.gh-proxy.org/"
-    printf '%s\n' "https://ghproxy.net/" "http://ghproxy.net/"
-    printf '%s\n' "https://ghfast.top/" "http://ghfast.top/"
+
+    if [[ "${GH_PROXY_PREFIX_MANUAL}" == "1" ]]; then
+        printf '%s\n' "${GH_PROXY_PREFIX}"
+        return 0
+    fi
+
+    known_proxy_prefixes
 }
 
 sanitize_remote_url() {
     local raw_url="$1"
     local cleaned_url="${raw_url}"
-    local changed="1"
-    local prefix=""
-    local -a prefixes=()
 
-    mapfile -t prefixes < <(known_proxy_prefixes)
-    while [[ "${changed}" == "1" ]]; do
-        changed="0"
-        for prefix in "${prefixes[@]}"; do
-            [[ -z "${prefix}" ]] && continue
-            if [[ "${cleaned_url}" == "${prefix}"http://* || "${cleaned_url}" == "${prefix}"https://* ]]; then
-                cleaned_url="${cleaned_url:${#prefix}}"
-                changed="1"
-            fi
-        done
-    done
+    # * 通过 https://*.github.com（含 github.com）定位真实目标地址，避免依赖固定代理前缀列表
+    if [[ "${cleaned_url}" =~ (https://([A-Za-z0-9-]+\.)?github\.com/[^[:space:]]+) ]]; then
+        cleaned_url="${BASH_REMATCH[1]}"
+        if [[ "${cleaned_url}" != "${raw_url}" ]]; then
+            print_warn "检测到 URL 代理前缀污染，已自动净化。"
+        fi
+    fi
 
     printf '%s' "${cleaned_url}"
 }
 
 sanitize_runtime_urls() {
     LATEST_RELEASE_API="$(sanitize_remote_url "${LATEST_RELEASE_API}")"
-    RECENT_RELEASES_API="$(sanitize_remote_url "${RECENT_RELEASES_API}")"
+    RELEASES_API_BASE="$(sanitize_remote_url "${RELEASES_API_BASE}")"
     TAG_RELEASE_API_BASE="$(sanitize_remote_url "${TAG_RELEASE_API_BASE}")"
 }
 
 build_url_candidates() {
     local raw_url="$1"
     local clean_url=""
+    local proxy_prefix=""
+    local candidate=""
+    local -a candidates=()
+    local -A seen_candidate=()
+
     ensure_proxy_prefix
     PROXY_MODE="$(normalize_proxy_mode "${PROXY_MODE}")"
     clean_url="$(sanitize_remote_url "${raw_url}")"
-    if [[ "${clean_url}" != http://* && "${clean_url}" != https://* ]]; then
-        print_error "URL 非法或被污染: ${raw_url}"
+    if [[ "${clean_url}" != https://* ]]; then
+        print_error "仅支持 https URL，当前地址非法或被污染: ${raw_url}"
         return 1
     fi
 
     case "${PROXY_MODE}" in
         off)
-            printf '%s\n' "${clean_url}"
+            candidates+=("${clean_url}")
             ;;
         on)
-            printf '%s\n' "${GH_PROXY_PREFIX}${clean_url}"
+            while IFS= read -r proxy_prefix; do
+                candidate="${proxy_prefix}${clean_url}"
+                if [[ -z "${seen_candidate["${candidate}"]+x}" ]]; then
+                    seen_candidate["${candidate}"]=1
+                    candidates+=("${candidate}")
+                fi
+            done < <(proxy_retry_prefixes)
             ;;
         auto)
-            printf '%s\n' "${clean_url}"
-            printf '%s\n' "${GH_PROXY_PREFIX}${clean_url}"
+            candidates+=("${clean_url}")
+            seen_candidate["${clean_url}"]=1
+            while IFS= read -r proxy_prefix; do
+                candidate="${proxy_prefix}${clean_url}"
+                if [[ -z "${seen_candidate["${candidate}"]+x}" ]]; then
+                    seen_candidate["${candidate}"]=1
+                    candidates+=("${candidate}")
+                fi
+            done < <(proxy_retry_prefixes)
             ;;
         *)
             print_error "无效 --proxy 参数: ${PROXY_MODE}（允许: auto|on|off）"
             exit 1
             ;;
     esac
+
+    if [[ "${#candidates[@]}" -eq 0 ]]; then
+        print_error "未生成可用请求地址，请检查代理配置。"
+        return 1
+    fi
+
+    printf '%s\n' "${candidates[@]}"
 }
 
 http_get() {
@@ -396,14 +463,24 @@ get_latest_version() {
 }
 
 list_recent_versions() {
+    local limit="${1:-6}"
     ensure_tools curl jq
+
+    if ! [[ "${limit}" =~ ^[1-9][0-9]*$ ]]; then
+        print_error "list 参数必须是正整数，当前值: ${limit}"
+        exit 1
+    fi
+
+    local list_api
+    list_api="${RELEASES_API_BASE}?page=1&per_page=${limit}"
+
     local json
-    json="$(http_get "${RECENT_RELEASES_API}")" || {
+    json="$(http_get "${list_api}")" || {
         print_error "获取最近版本列表失败。"
         exit 1
     }
 
-    print_info "最近 6 个发布版本:"
+    print_info "最近 ${limit} 个发布版本:"
     printf '%s' "${json}" | jq -r '.[] | "- \(.tag_name)  (\(.published_at // "unknown"))"'
 }
 
@@ -867,6 +944,11 @@ parse_global_options() {
                 PROXY_MODE="${1#*=}"
                 shift
                 ;;
+            --proxy-prefix=*)
+                GH_PROXY_PREFIX="${1#*=}"
+                GH_PROXY_PREFIX_MANUAL=1
+                shift
+                ;;
             --yes|-y)
                 AUTO_CONFIRM=1
                 shift
@@ -900,7 +982,23 @@ main() {
             get_latest_version
             ;;
         list)
-            list_recent_versions
+            local list_count="6"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --count=*)
+                        list_count="${1#*=}"
+                        ;;
+                    [0-9]*)
+                        list_count="$1"
+                        ;;
+                    *)
+                        print_error "list 不支持的参数: $1"
+                        exit 1
+                        ;;
+                esac
+                shift
+            done
+            list_recent_versions "${list_count}"
             ;;
         install)
             local requested="latest"
@@ -911,6 +1009,10 @@ main() {
                         ;;
                     --proxy=*)
                         PROXY_MODE="${1#*=}"
+                        ;;
+                    --proxy-prefix=*)
+                        GH_PROXY_PREFIX="${1#*=}"
+                        GH_PROXY_PREFIX_MANUAL=1
                         ;;
                     --yes|-y)
                         AUTO_CONFIRM=1
