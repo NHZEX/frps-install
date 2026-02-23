@@ -1,0 +1,17 @@
+# * 基础连接配置：通过环境变量模板渲染，便于 Docker Compose 统一注入。
+serverAddr = "{{ .Envs.FRP_SERVER_ADDR }}"
+serverPort = {{ .Envs.FRP_SERVER_PORT }}
+# * 如果默认 STUN 不可用，可启用以下配置并注入 FRP_NAT_HOLE_STUN_SERVER。
+# natHoleStunServer = "{{ .Envs.FRP_NAT_HOLE_STUN_SERVER }}"
+
+auth.method = "token"
+auth.token = "{{ .Envs.FRP_AUTH_TOKEN }}"
+
+log.level = "{{ .Envs.FRP_LOG_LEVEL }}"
+
+# * frpc Web 管理界面配置：支持通过环境变量统一调整。
+webServer.addr = "{{ .Envs.FRPC_WEB_ADDR }}"
+webServer.port = {{ .Envs.FRPC_WEB_PORT }}
+webServer.user = "{{ .Envs.FRPC_WEB_USER }}"
+webServer.password = "{{ .Envs.FRPC_WEB_PASSWORD }}"
+webServer.pprofEnable = {{ .Envs.FRPC_WEB_PPROF_ENABLE }}
