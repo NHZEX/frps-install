@@ -12,13 +12,21 @@ Blue="\033[34m"
 Font="\033[0m"
 
 # * 可配置变量（支持环境变量覆盖）
-FRP_NAME="${FRP_NAME:-frps}"
+FRPS_NAME="${FRPS_NAME:-${FRP_NAME:-frps}}"
+FRPC_NAME="${FRPC_NAME:-frpc}"
 GITHUB_OWNER="${GITHUB_OWNER:-fatedier}"
 GITHUB_REPO="${GITHUB_REPO:-frp}"
-INSTALL_BIN_PATH="${INSTALL_BIN_PATH:-/usr/local/bin/frps}"
+INSTALL_BIN_PATH_FRPS="${INSTALL_BIN_PATH_FRPS:-${INSTALL_BIN_PATH:-/usr/local/bin/frps}}"
+INSTALL_BIN_PATH_FRPC="${INSTALL_BIN_PATH_FRPC:-/usr/local/bin/frpc}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/frp}"
-CONFIG_PATH="${CONFIG_PATH:-/etc/frp/frps.toml}"
+FRPS_CONFIG_PATH="${FRPS_CONFIG_PATH:-${CONFIG_PATH:-/etc/frp/frps.toml}}"
+FRPC_CONFIG_PATH="${FRPC_CONFIG_PATH:-/etc/frp/frpc.toml}"
 SYSTEMD_UNIT_PATH="${SYSTEMD_UNIT_PATH:-/etc/systemd/system/frps.service}"
+
+# * 兼容旧变量名
+FRP_NAME="${FRPS_NAME}"
+INSTALL_BIN_PATH="${INSTALL_BIN_PATH_FRPS}"
+CONFIG_PATH="${FRPS_CONFIG_PATH}"
 
 # * 标记用户是否手动指定了代理前缀（环境变量或命令行）
 if [[ -n "${GH_PROXY_PREFIX+x}" ]]; then
@@ -39,6 +47,8 @@ DEFAULT_PROXY_PREFIXES=(
 
 # * 代理模式: auto|on|off
 PROXY_MODE="${PROXY_MODE:-auto}"
+# * frpc 同步模式: auto|on|off
+SYNC_FRPC_MODE="${SYNC_FRPC_MODE:-auto}"
 AUTO_CONFIRM="${AUTO_CONFIRM:-0}"
 AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-1}"
 HTTP_CONNECT_TIMEOUT="${HTTP_CONNECT_TIMEOUT:-8}"
@@ -46,8 +56,10 @@ HTTP_MAX_TIME="${HTTP_MAX_TIME:-30}"
 TMP_ROOT="${TMP_ROOT:-/tmp}"
 
 # * 兼容旧路径（用于提示与清理）
-LEGACY_BIN_PATH="/usr/local/frp/frps"
-LEGACY_CONFIG_PATH="/usr/local/frp/frps.toml"
+LEGACY_BIN_PATH_FRPS="/usr/local/frp/frps"
+LEGACY_BIN_PATH_FRPC="/usr/local/frp/frpc"
+LEGACY_CONFIG_PATH_FRPS="/usr/local/frp/frps.toml"
+LEGACY_CONFIG_PATH_FRPC="/usr/local/frp/frpc.toml"
 LEGACY_UNIT_PATH="/lib/systemd/system/frps.service"
 
 LATEST_RELEASE_API="https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases/latest"
@@ -82,7 +94,7 @@ trap cleanup_temp EXIT
 
 usage() {
     cat <<'EOF'
-frps 安装与管理脚本（仅 frps）
+frps 安装与管理脚本（支持可选同步 frpc）
 
 用法:
   ./frps_linux_install.sh [全局参数] <命令> [命令参数]
@@ -92,6 +104,9 @@ frps 安装与管理脚本（仅 frps）
   --proxy=auto|on|off   GitHub 请求代理模式，默认 auto
                         auto: 先直连失败后代理；on: 始终代理；off: 始终直连
   --proxy-prefix=URL    手动指定单个代理前缀（必须 https:// 开头）
+  --frpc[=MODE]         安装/升级时是否同步释放 frpc（auto|on|off）
+                        --frpc 等同 --frpc=on
+                        auto: 仅检测到现有 frpc 时同步升级；on: 总是同步；off: 不同步
   -y, --yes             自动确认（跳过交互确认）
   -h, --help            显示帮助
 
@@ -112,12 +127,13 @@ frps 安装与管理脚本（仅 frps）
         ./frps_linux_install.sh install
         ./frps_linux_install.sh install 0.67.0
         ./frps_linux_install.sh install v0.67.0
+        ./frps_linux_install.sh install --frpc=on
 
   update
-      更新到最新版本（等同 install）
+      更新到最新版本（等同 install，可配合 --frpc 使用）
 
   info
-      显示安装信息：安装路径、配置路径、当前版本、systemd 状态
+      显示安装信息：frps/frpc 安装路径、配置路径、版本、systemd 状态
 
   edit [EDITOR]
       使用编辑器打开配置文件（默认 nano）
@@ -129,7 +145,7 @@ frps 安装与管理脚本（仅 frps）
       管理 systemd 服务
 
   uninstall [--purge]
-      卸载 frps 二进制与 systemd；默认保留配置文件
+      卸载 frps/frpc 二进制与 systemd；默认保留配置文件
       --purge: 一并删除配置文件
 EOF
 
@@ -234,6 +250,53 @@ normalize_proxy_mode() {
             ;;
         *)
             print_error "无效 --proxy 参数: ${mode}（允许: auto|on|off；别名: always|force|proxy）"
+            exit 1
+            ;;
+    esac
+}
+
+normalize_sync_frpc_mode() {
+    local mode="${1:-auto}"
+    mode="${mode,,}"
+    case "${mode}" in
+        auto|on|off)
+            echo "${mode}"
+            ;;
+        yes|true|enable|enabled|with)
+            echo "on"
+            ;;
+        no|false|disable|disabled|without)
+            echo "off"
+            ;;
+        *)
+            print_error "无效 --frpc 参数: ${mode}（允许: auto|on|off）"
+            exit 1
+            ;;
+    esac
+}
+
+has_existing_frpc_release() {
+    [[ -x "${INSTALL_BIN_PATH_FRPC}" || -x "${LEGACY_BIN_PATH_FRPC}" || -f "${FRPC_CONFIG_PATH}" || -f "${LEGACY_CONFIG_PATH_FRPC}" ]]
+}
+
+resolve_sync_frpc_flag() {
+    SYNC_FRPC_MODE="$(normalize_sync_frpc_mode "${SYNC_FRPC_MODE}")"
+    case "${SYNC_FRPC_MODE}" in
+        on)
+            echo "1"
+            ;;
+        off)
+            echo "0"
+            ;;
+        auto)
+            if has_existing_frpc_release; then
+                echo "1"
+            else
+                echo "0"
+            fi
+            ;;
+        *)
+            print_error "无效 SYNC_FRPC_MODE: ${SYNC_FRPC_MODE}"
             exit 1
             ;;
     esac
@@ -502,10 +565,11 @@ get_asset_value() {
     ' | head -n1
 }
 
-get_installed_version() {
+get_binary_version_by_path() {
+    local binary_path="$1"
     local detected=""
-    if [[ -x "${INSTALL_BIN_PATH}" ]]; then
-        detected="$("${INSTALL_BIN_PATH}" -v 2>/dev/null | head -n1 | awk '{print $1}')"
+    if [[ -x "${binary_path}" ]]; then
+        detected="$("${binary_path}" -v 2>/dev/null | head -n1 | awk '{print $1}')"
         if [[ -n "${detected}" ]]; then
             echo "${detected}"
             return 0
@@ -514,11 +578,21 @@ get_installed_version() {
     return 1
 }
 
+get_installed_version() {
+    get_binary_version_by_path "${INSTALL_BIN_PATH_FRPS}"
+}
+
+get_installed_version_frpc() {
+    get_binary_version_by_path "${INSTALL_BIN_PATH_FRPC}"
+}
+
 show_legacy_warning_if_exists() {
-    if [[ -e "${LEGACY_BIN_PATH}" || -e "${LEGACY_CONFIG_PATH}" || -e "${LEGACY_UNIT_PATH}" ]]; then
+    if [[ -e "${LEGACY_BIN_PATH_FRPS}" || -e "${LEGACY_BIN_PATH_FRPC}" || -e "${LEGACY_CONFIG_PATH_FRPS}" || -e "${LEGACY_CONFIG_PATH_FRPC}" || -e "${LEGACY_UNIT_PATH}" ]]; then
         print_warn "检测到旧路径遗留文件:"
-        [[ -e "${LEGACY_BIN_PATH}" ]] && print_warn "  - ${LEGACY_BIN_PATH}"
-        [[ -e "${LEGACY_CONFIG_PATH}" ]] && print_warn "  - ${LEGACY_CONFIG_PATH}"
+        [[ -e "${LEGACY_BIN_PATH_FRPS}" ]] && print_warn "  - ${LEGACY_BIN_PATH_FRPS}"
+        [[ -e "${LEGACY_BIN_PATH_FRPC}" ]] && print_warn "  - ${LEGACY_BIN_PATH_FRPC}"
+        [[ -e "${LEGACY_CONFIG_PATH_FRPS}" ]] && print_warn "  - ${LEGACY_CONFIG_PATH_FRPS}"
+        [[ -e "${LEGACY_CONFIG_PATH_FRPC}" ]] && print_warn "  - ${LEGACY_CONFIG_PATH_FRPC}"
         [[ -e "${LEGACY_UNIT_PATH}" ]] && print_warn "  - ${LEGACY_UNIT_PATH}"
         print_warn "建议通过本脚本执行 uninstall 清理旧路径文件。"
     fi
@@ -535,7 +609,7 @@ Wants=network.target
 Type=simple
 Restart=on-failure
 RestartSec=5s
-ExecStart=${INSTALL_BIN_PATH} -c ${CONFIG_PATH}
+ExecStart=${INSTALL_BIN_PATH_FRPS} -c ${FRPS_CONFIG_PATH}
 
 [Install]
 WantedBy=multi-user.target
@@ -563,7 +637,7 @@ service_unregister() {
     if ! systemd_available; then
         print_warn "当前系统未检测到 systemctl，跳过 unregister。"
     else
-        systemctl disable --now "${FRP_NAME}" >/dev/null 2>&1 || true
+        systemctl disable --now "${FRPS_NAME}" >/dev/null 2>&1 || true
     fi
 
     rm -f "${SYSTEMD_UNIT_PATH}"
@@ -582,8 +656,8 @@ service_enable() {
         print_error "未检测到 systemctl，无法 enable。"
         exit 1
     fi
-    systemctl enable "${FRP_NAME}"
-    print_ok "已启用开机自启动: ${FRP_NAME}"
+    systemctl enable "${FRPS_NAME}"
+    print_ok "已启用开机自启动: ${FRPS_NAME}"
 }
 
 service_disable() {
@@ -592,8 +666,8 @@ service_disable() {
         print_error "未检测到 systemctl，无法 disable。"
         exit 1
     fi
-    systemctl disable "${FRP_NAME}"
-    print_ok "已禁用开机自启动: ${FRP_NAME}"
+    systemctl disable "${FRPS_NAME}"
+    print_ok "已禁用开机自启动: ${FRPS_NAME}"
 }
 
 service_start() {
@@ -602,8 +676,8 @@ service_start() {
         print_error "未检测到 systemctl，无法 start。"
         exit 1
     fi
-    systemctl start "${FRP_NAME}"
-    print_ok "服务已启动: ${FRP_NAME}"
+    systemctl start "${FRPS_NAME}"
+    print_ok "服务已启动: ${FRPS_NAME}"
 }
 
 service_stop() {
@@ -612,8 +686,8 @@ service_stop() {
         print_error "未检测到 systemctl，无法 stop。"
         exit 1
     fi
-    systemctl stop "${FRP_NAME}"
-    print_ok "服务已停止: ${FRP_NAME}"
+    systemctl stop "${FRPS_NAME}"
+    print_ok "服务已停止: ${FRPS_NAME}"
 }
 
 service_restart() {
@@ -622,8 +696,8 @@ service_restart() {
         print_error "未检测到 systemctl，无法 restart。"
         exit 1
     fi
-    systemctl restart "${FRP_NAME}"
-    print_ok "服务已重启: ${FRP_NAME}"
+    systemctl restart "${FRPS_NAME}"
+    print_ok "服务已重启: ${FRPS_NAME}"
 }
 
 service_status() {
@@ -631,24 +705,31 @@ service_status() {
         print_warn "未检测到 systemctl。"
         return 0
     fi
-    systemctl status "${FRP_NAME}" --no-pager
+    systemctl status "${FRPS_NAME}" --no-pager
 }
 
 show_install_info() {
     local installed_version="未安装"
+    local installed_version_frpc="未安装"
     if version="$(get_installed_version)"; then
         installed_version="${version}"
     fi
+    if version_frpc="$(get_installed_version_frpc)"; then
+        installed_version_frpc="${version_frpc}"
+    fi
 
-    echo "安装路径: ${INSTALL_BIN_PATH}"
-    echo "配置文件路径: ${CONFIG_PATH}"
+    echo "frps 安装路径: ${INSTALL_BIN_PATH_FRPS}"
+    echo "frps 配置文件路径: ${FRPS_CONFIG_PATH}"
+    echo "frpc 安装路径: ${INSTALL_BIN_PATH_FRPC}"
+    echo "frpc 配置文件路径: ${FRPC_CONFIG_PATH}"
     echo "systemd 单元路径: ${SYSTEMD_UNIT_PATH}"
-    echo "当前版本: ${installed_version}"
+    echo "frps 当前版本: ${installed_version}"
+    echo "frpc 当前版本: ${installed_version_frpc}"
 
     if systemd_available; then
         local enabled_state active_state
-        enabled_state="$(systemctl is-enabled "${FRP_NAME}" 2>/dev/null || true)"
-        active_state="$(systemctl is-active "${FRP_NAME}" 2>/dev/null || true)"
+        enabled_state="$(systemctl is-enabled "${FRPS_NAME}" 2>/dev/null || true)"
+        active_state="$(systemctl is-active "${FRPS_NAME}" 2>/dev/null || true)"
         echo "服务启用状态: ${enabled_state:-unknown}"
         echo "服务运行状态: ${active_state:-unknown}"
     else
@@ -700,30 +781,55 @@ ensure_config_file() {
 
     mkdir -p "${CONFIG_DIR}"
 
-    if [[ -f "${CONFIG_PATH}" ]]; then
-        print_info "配置文件已存在，保持不覆盖: ${CONFIG_PATH}"
+    if [[ -f "${FRPS_CONFIG_PATH}" ]]; then
+        print_info "frps 配置文件已存在，保持不覆盖: ${FRPS_CONFIG_PATH}"
         return 0
     fi
 
-    if [[ -f "${LEGACY_CONFIG_PATH}" ]]; then
-        print_warn "检测到旧配置文件: ${LEGACY_CONFIG_PATH}"
-        if confirm "是否迁移旧配置到新路径 ${CONFIG_PATH}?" 0; then
-            cp -f "${LEGACY_CONFIG_PATH}" "${CONFIG_PATH}"
-            print_ok "已迁移旧配置到: ${CONFIG_PATH}"
+    if [[ -f "${LEGACY_CONFIG_PATH_FRPS}" ]]; then
+        print_warn "检测到旧 frps 配置文件: ${LEGACY_CONFIG_PATH_FRPS}"
+        if confirm "是否迁移旧 frps 配置到新路径 ${FRPS_CONFIG_PATH}?" 0; then
+            cp -f "${LEGACY_CONFIG_PATH_FRPS}" "${FRPS_CONFIG_PATH}"
+            print_ok "已迁移旧 frps 配置到: ${FRPS_CONFIG_PATH}"
             return 0
         fi
     fi
 
-    cp -f "${extracted_config_path}" "${CONFIG_PATH}"
-    print_ok "已生成默认配置: ${CONFIG_PATH}"
+    cp -f "${extracted_config_path}" "${FRPS_CONFIG_PATH}"
+    print_ok "已生成默认 frps 配置: ${FRPS_CONFIG_PATH}"
+}
+
+ensure_frpc_config_file() {
+    local extracted_config_path_frpc="$1"
+    require_root
+
+    mkdir -p "${CONFIG_DIR}"
+
+    if [[ -f "${FRPC_CONFIG_PATH}" ]]; then
+        print_info "frpc 配置文件已存在，保持不覆盖: ${FRPC_CONFIG_PATH}"
+        return 0
+    fi
+
+    if [[ -f "${LEGACY_CONFIG_PATH_FRPC}" ]]; then
+        print_warn "检测到旧 frpc 配置文件: ${LEGACY_CONFIG_PATH_FRPC}"
+        if confirm "是否迁移旧 frpc 配置到新路径 ${FRPC_CONFIG_PATH}?" 0; then
+            cp -f "${LEGACY_CONFIG_PATH_FRPC}" "${FRPC_CONFIG_PATH}"
+            print_ok "已迁移旧 frpc 配置到: ${FRPC_CONFIG_PATH}"
+            return 0
+        fi
+    fi
+
+    cp -f "${extracted_config_path_frpc}" "${FRPC_CONFIG_PATH}"
+    print_ok "已生成默认 frpc 配置: ${FRPC_CONFIG_PATH}"
 }
 
 install_binary_and_config() {
     local version="$1"
     local arch="$2"
     local release_json="$3"
+    local sync_frpc_flag="${4:-0}"
     local tag tarball_name tarball_url digest
-    local tarball_path extracted_dir extracted_bin extracted_cfg
+    local tarball_path extracted_dir extracted_bin extracted_cfg extracted_bin_frpc extracted_cfg_frpc
 
     tag="$(version_to_tag "${version}")"
     tarball_name="frp_${version}_linux_${arch}.tar.gz"
@@ -749,8 +855,10 @@ install_binary_and_config() {
 
     tar -xzf "${tarball_path}" -C "${CURRENT_TEMP_DIR}"
     extracted_dir="${CURRENT_TEMP_DIR}/frp_${version}_linux_${arch}"
-    extracted_bin="${extracted_dir}/${FRP_NAME}"
-    extracted_cfg="${extracted_dir}/${FRP_NAME}.toml"
+    extracted_bin="${extracted_dir}/${FRPS_NAME}"
+    extracted_bin_frpc="${extracted_dir}/${FRPC_NAME}"
+    extracted_cfg="${extracted_dir}/${FRPS_NAME}.toml"
+    extracted_cfg_frpc="${extracted_dir}/${FRPC_NAME}.toml"
 
     if [[ ! -f "${extracted_bin}" ]]; then
         print_error "解压后未找到二进制: ${extracted_bin}"
@@ -760,12 +868,30 @@ install_binary_and_config() {
         print_error "解压后未找到配置模板: ${extracted_cfg}"
         exit 1
     fi
+    if [[ "${sync_frpc_flag}" == "1" ]]; then
+        if [[ ! -f "${extracted_bin_frpc}" ]]; then
+            print_error "解压后未找到 frpc 二进制: ${extracted_bin_frpc}"
+            exit 1
+        fi
+        if [[ ! -f "${extracted_cfg_frpc}" ]]; then
+            print_error "解压后未找到 frpc 配置模板: ${extracted_cfg_frpc}"
+            exit 1
+        fi
+    fi
 
     require_root
-    install -m 0755 "${extracted_bin}" "${INSTALL_BIN_PATH}"
-    print_ok "已安装二进制: ${INSTALL_BIN_PATH}"
+    install -m 0755 "${extracted_bin}" "${INSTALL_BIN_PATH_FRPS}"
+    print_ok "已安装二进制: ${INSTALL_BIN_PATH_FRPS}"
 
     ensure_config_file "${extracted_cfg}"
+
+    if [[ "${sync_frpc_flag}" == "1" ]]; then
+        install -m 0755 "${extracted_bin_frpc}" "${INSTALL_BIN_PATH_FRPC}"
+        print_ok "已安装二进制: ${INSTALL_BIN_PATH_FRPC}"
+        ensure_frpc_config_file "${extracted_cfg_frpc}"
+    else
+        print_info "本次未同步释放 frpc（SYNC_FRPC_MODE=${SYNC_FRPC_MODE}）。"
+    fi
 }
 
 resolve_target_version() {
@@ -780,10 +906,15 @@ resolve_target_version() {
 confirm_install_summary() {
     local version="$1"
     local arch="$2"
+    local sync_frpc_flag="${3:-0}"
     local current="未安装"
+    local sync_frpc_text="否"
 
     if old_version="$(get_installed_version)"; then
         current="${old_version}"
+    fi
+    if [[ "${sync_frpc_flag}" == "1" ]]; then
+        sync_frpc_text="是"
     fi
 
     echo "=============================================="
@@ -791,8 +922,13 @@ confirm_install_summary() {
     echo "当前版本: ${current}"
     echo "目标版本: ${version}"
     echo "系统架构: ${arch}"
-    echo "安装路径: ${INSTALL_BIN_PATH}"
-    echo "配置路径: ${CONFIG_PATH}"
+    echo "frps 安装路径: ${INSTALL_BIN_PATH_FRPS}"
+    echo "frps 配置路径: ${FRPS_CONFIG_PATH}"
+    echo "同步释放 frpc: ${sync_frpc_text}（模式: ${SYNC_FRPC_MODE}）"
+    if [[ "${sync_frpc_flag}" == "1" ]]; then
+        echo "frpc 安装路径: ${INSTALL_BIN_PATH_FRPC}"
+        echo "frpc 配置路径: ${FRPC_CONFIG_PATH}"
+    fi
     echo "systemd 路径: ${SYSTEMD_UNIT_PATH}"
     echo "代理模式: ${PROXY_MODE}"
     echo "=============================================="
@@ -805,14 +941,15 @@ confirm_install_summary() {
 
 install_or_update() {
     local requested_version="${1:-latest}"
-    local version arch release_json
+    local version arch release_json sync_frpc_flag
 
     ensure_tools curl jq tar sha256sum
     require_root
 
     arch="$(detect_arch)"
     version="$(resolve_target_version "${requested_version}")"
-    confirm_install_summary "${version}" "${arch}"
+    sync_frpc_flag="$(resolve_sync_frpc_flag)"
+    confirm_install_summary "${version}" "${arch}" "${sync_frpc_flag}"
 
     print_info "获取发布信息: v${version}"
     release_json="$(fetch_release_json_by_version "${version}")" || {
@@ -820,15 +957,15 @@ install_or_update() {
         exit 1
     }
 
-    install_binary_and_config "${version}" "${arch}" "${release_json}"
+    install_binary_and_config "${version}" "${arch}" "${release_json}" "${sync_frpc_flag}"
 
     if systemd_available; then
         service_register
-        systemctl enable "${FRP_NAME}" >/dev/null 2>&1 || true
-        if systemctl is-active --quiet "${FRP_NAME}"; then
-            systemctl restart "${FRP_NAME}" || print_warn "服务重启失败，请手动检查配置。"
+        systemctl enable "${FRPS_NAME}" >/dev/null 2>&1 || true
+        if systemctl is-active --quiet "${FRPS_NAME}"; then
+            systemctl restart "${FRPS_NAME}" || print_warn "服务重启失败，请手动检查配置。"
         else
-            systemctl start "${FRP_NAME}" || print_warn "服务启动失败，请先检查配置后手动启动。"
+            systemctl start "${FRPS_NAME}" || print_warn "服务启动失败，请先检查配置后手动启动。"
         fi
         print_ok "systemd 已注册，已尝试启用自启动并启动服务。"
     else
@@ -844,16 +981,16 @@ run_edit() {
     local editor="${1:-nano}"
     ensure_tools "${editor}"
 
-    if [[ ! -f "${CONFIG_PATH}" ]]; then
-        print_error "配置文件不存在: ${CONFIG_PATH}，请先执行 install。"
+    if [[ ! -f "${FRPS_CONFIG_PATH}" ]]; then
+        print_error "frps 配置文件不存在: ${FRPS_CONFIG_PATH}，请先执行 install。"
         exit 1
     fi
 
-    if [[ ! -w "${CONFIG_PATH}" ]] && ! is_root; then
+    if [[ ! -w "${FRPS_CONFIG_PATH}" ]] && ! is_root; then
         print_warn "当前用户可能没有写权限，建议使用 sudo 执行 edit。"
     fi
 
-    "${editor}" "${CONFIG_PATH}"
+    "${editor}" "${FRPS_CONFIG_PATH}"
 }
 
 run_uninstall() {
@@ -862,14 +999,18 @@ run_uninstall() {
 
     echo "=============================================="
     echo "准备卸载 frps"
-    echo "将删除二进制: ${INSTALL_BIN_PATH}"
+    echo "将删除 frps 二进制: ${INSTALL_BIN_PATH_FRPS}"
+    echo "将删除 frpc 二进制: ${INSTALL_BIN_PATH_FRPC}"
     echo "将卸载 unit: ${SYSTEMD_UNIT_PATH}"
     echo "将清理旧路径 unit: ${LEGACY_UNIT_PATH}"
     if [[ "${purge_config}" == "1" ]]; then
-        echo "将删除配置: ${CONFIG_PATH}"
-        echo "将清理旧配置: ${LEGACY_CONFIG_PATH}"
+        echo "将删除 frps 配置: ${FRPS_CONFIG_PATH}"
+        echo "将删除 frpc 配置: ${FRPC_CONFIG_PATH}"
+        echo "将清理旧 frps 配置: ${LEGACY_CONFIG_PATH_FRPS}"
+        echo "将清理旧 frpc 配置: ${LEGACY_CONFIG_PATH_FRPC}"
     else
-        echo "保留配置: ${CONFIG_PATH}"
+        echo "保留 frps 配置: ${FRPS_CONFIG_PATH}"
+        echo "保留 frpc 配置: ${FRPC_CONFIG_PATH}"
     fi
     echo "=============================================="
 
@@ -879,11 +1020,11 @@ run_uninstall() {
     fi
 
     if systemd_available; then
-        systemctl disable --now "${FRP_NAME}" >/dev/null 2>&1 || true
+        systemctl disable --now "${FRPS_NAME}" >/dev/null 2>&1 || true
     fi
 
-    rm -f "${INSTALL_BIN_PATH}"
-    rm -f "${LEGACY_BIN_PATH}"
+    rm -f "${INSTALL_BIN_PATH_FRPS}" "${INSTALL_BIN_PATH_FRPC}"
+    rm -f "${LEGACY_BIN_PATH_FRPS}" "${LEGACY_BIN_PATH_FRPC}"
 
     rm -f "${SYSTEMD_UNIT_PATH}" "${LEGACY_UNIT_PATH}"
     if systemd_available; then
@@ -891,14 +1032,15 @@ run_uninstall() {
     fi
 
     if [[ "${purge_config}" == "1" ]]; then
-        rm -f "${CONFIG_PATH}" "${LEGACY_CONFIG_PATH}"
+        rm -f "${FRPS_CONFIG_PATH}" "${FRPC_CONFIG_PATH}" "${LEGACY_CONFIG_PATH_FRPS}" "${LEGACY_CONFIG_PATH_FRPC}"
         rmdir --ignore-fail-on-non-empty "${CONFIG_DIR}" 2>/dev/null || true
         print_ok "配置文件已删除。"
     fi
 
     print_ok "卸载完成。"
     if [[ "${purge_config}" != "1" ]]; then
-        print_info "配置文件仍保留在: ${CONFIG_PATH}"
+        print_info "frps 配置文件仍保留在: ${FRPS_CONFIG_PATH}"
+        print_info "frpc 配置文件仍保留在: ${FRPC_CONFIG_PATH}"
     fi
 }
 
@@ -949,6 +1091,24 @@ parse_global_options() {
                 GH_PROXY_PREFIX_MANUAL=1
                 shift
                 ;;
+            --frpc)
+                SYNC_FRPC_MODE="on"
+                shift
+                ;;
+            --frpc=*)
+                SYNC_FRPC_MODE="${1#*=}"
+                shift
+                ;;
+            --sync-frpc|--sync-frpc=*)
+                # * 兼容旧参数，建议改用 --frpc
+                if [[ "$1" == "--sync-frpc" ]]; then
+                    SYNC_FRPC_MODE="on"
+                else
+                    SYNC_FRPC_MODE="${1#*=}"
+                fi
+                print_warn "参数 --sync-frpc 已弃用，请使用 --frpc"
+                shift
+                ;;
             --yes|-y)
                 AUTO_CONFIRM=1
                 shift
@@ -964,6 +1124,7 @@ parse_global_options() {
     done
 
     PROXY_MODE="$(normalize_proxy_mode "${PROXY_MODE}")"
+    SYNC_FRPC_MODE="$(normalize_sync_frpc_mode "${SYNC_FRPC_MODE}")"
     ensure_proxy_prefix
     sanitize_runtime_urls
 
@@ -1014,6 +1175,21 @@ main() {
                         GH_PROXY_PREFIX="${1#*=}"
                         GH_PROXY_PREFIX_MANUAL=1
                         ;;
+                    --frpc)
+                        SYNC_FRPC_MODE="on"
+                        ;;
+                    --frpc=*)
+                        SYNC_FRPC_MODE="${1#*=}"
+                        ;;
+                    --sync-frpc|--sync-frpc=*)
+                        # * 兼容旧参数，建议改用 --frpc
+                        if [[ "$1" == "--sync-frpc" ]]; then
+                            SYNC_FRPC_MODE="on"
+                        else
+                            SYNC_FRPC_MODE="${1#*=}"
+                        fi
+                        print_warn "参数 --sync-frpc 已弃用，请使用 --frpc"
+                        ;;
                     --yes|-y)
                         AUTO_CONFIRM=1
                         ;;
@@ -1029,9 +1205,46 @@ main() {
                 shift
             done
             PROXY_MODE="$(normalize_proxy_mode "${PROXY_MODE}")"
+            SYNC_FRPC_MODE="$(normalize_sync_frpc_mode "${SYNC_FRPC_MODE}")"
             install_or_update "${requested}"
             ;;
         update)
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --proxy=*)
+                        PROXY_MODE="${1#*=}"
+                        ;;
+                    --proxy-prefix=*)
+                        GH_PROXY_PREFIX="${1#*=}"
+                        GH_PROXY_PREFIX_MANUAL=1
+                        ;;
+                    --frpc)
+                        SYNC_FRPC_MODE="on"
+                        ;;
+                    --frpc=*)
+                        SYNC_FRPC_MODE="${1#*=}"
+                        ;;
+                    --sync-frpc|--sync-frpc=*)
+                        # * 兼容旧参数，建议改用 --frpc
+                        if [[ "$1" == "--sync-frpc" ]]; then
+                            SYNC_FRPC_MODE="on"
+                        else
+                            SYNC_FRPC_MODE="${1#*=}"
+                        fi
+                        print_warn "参数 --sync-frpc 已弃用，请使用 --frpc"
+                        ;;
+                    --yes|-y)
+                        AUTO_CONFIRM=1
+                        ;;
+                    *)
+                        print_error "update 不支持的参数: $1"
+                        exit 1
+                        ;;
+                esac
+                shift
+            done
+            PROXY_MODE="$(normalize_proxy_mode "${PROXY_MODE}")"
+            SYNC_FRPC_MODE="$(normalize_sync_frpc_mode "${SYNC_FRPC_MODE}")"
             install_or_update "latest"
             ;;
         info)
